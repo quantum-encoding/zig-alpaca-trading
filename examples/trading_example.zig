@@ -5,7 +5,7 @@
 // Licensed under the MIT License. See LICENSE file for details.
 
 const std = @import("std");
-const AlpacaClient = @import("quantum-alpaca").AlpacaClient;
+const AlpacaClient = @import("../src/alpaca_client.zig").AlpacaClient;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};

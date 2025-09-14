@@ -31,7 +31,7 @@ pub const AlpacaClient = struct {
             };
         }
 
-        pub fn getDataUrl(self: Environment) []const u8 {
+        pub fn getDataUrl(_: Environment) []const u8 {
             return "https://data.alpaca.markets";
         }
     };
@@ -125,71 +125,6 @@ pub const AlpacaClient = struct {
     pub const OrderClass = types.OrderClass;
     pub const Activity = types.Activity;
     pub const PortfolioHistory = types.PortfolioHistory;
-    
-    // Legacy structures (kept for compatibility)
-    pub const Account = struct {
-        id: []const u8,
-        account_number: []const u8,
-        status: []const u8,
-        currency: []const u8,
-        buying_power: []const u8,
-        portfolio_value: []const u8,
-        cash: []const u8,
-        pattern_day_trader: bool,
-        trading_blocked: bool,
-        transfers_blocked: bool,
-        account_blocked: bool,
-        trade_suspended_by_user: bool,
-        daytrade_count: i32,
-        daytrading_buying_power: []const u8,
-    };
-
-    pub const Position = struct {
-        asset_id: []const u8,
-        symbol: []const u8,
-        exchange: []const u8,
-        asset_class: []const u8,
-        qty: []const u8,
-        qty_available: []const u8,
-        avg_entry_price: []const u8,
-        side: []const u8,
-        market_value: []const u8,
-        cost_basis: []const u8,
-        unrealized_pl: []const u8,
-        unrealized_plpc: []const u8,
-        unrealized_intraday_pl: []const u8,
-        unrealized_intraday_plpc: []const u8,
-        current_price: []const u8,
-        lastday_price: []const u8,
-        change_today: []const u8,
-    };
-
-    pub const Order = struct {
-        id: []const u8,
-        client_order_id: []const u8,
-        created_at: []const u8,
-        updated_at: []const u8,
-        submitted_at: []const u8,
-        filled_at: ?[]const u8,
-        expired_at: ?[]const u8,
-        canceled_at: ?[]const u8,
-        failed_at: ?[]const u8,
-        asset_id: []const u8,
-        symbol: []const u8,
-        asset_class: []const u8,
-        notional: ?[]const u8,
-        qty: ?[]const u8,
-        filled_qty: []const u8,
-        type: []const u8,
-        side: []const u8,
-        time_in_force: []const u8,
-        limit_price: ?[]const u8,
-        stop_price: ?[]const u8,
-        filled_avg_price: ?[]const u8,
-        status: []const u8,
-        extended_hours: bool,
-        legs: ?[]Order,
-    };
 
     pub const OrderRequest = struct {
         symbol: []const u8,
@@ -233,12 +168,12 @@ pub const AlpacaClient = struct {
         const uri = try std.Uri.parse(url);
         
         const auth_headers = try self.makeAuthHeaders();
-        var headers = std.ArrayList(http.Header).init(self.allocator);
-        defer headers.deinit();
+        var headers = std.ArrayList(http.Header).empty;
+        defer headers.deinit(self.allocator);
         
-        try headers.appendSlice(&auth_headers);
+        try headers.appendSlice(self.allocator, &auth_headers);
         if (body != null) {
-            try headers.append(.{ .name = "Content-Type", .value = "application/json" });
+            try headers.append(self.allocator, .{ .name = "Content-Type", .value = "application/json" });
         }
 
         var req = try self.client.request(method, uri, .{
@@ -267,33 +202,44 @@ pub const AlpacaClient = struct {
         );
         defer self.allocator.free(body_data);
 
-        const body_slice = try self.allocator.dupe(u8, body_data);
-        
-        // Extract headers for rate limit info
-        const headers_copy = try self.allocator.alloc(http.Header, response.head.headers.list.items.len);
-        for (response.head.headers.list.items, 0..) |header, i| {
-            headers_copy[i] = header;
-        }
-        
-        // Extract request ID if present
-        var request_id: ?[]const u8 = null;
-        for (headers_copy) |header| {
-            if (std.mem.eql(u8, header.name, "X-Request-Id")) {
-                request_id = try self.allocator.dupe(u8, header.value);
-                break;
+        // Check if response is gzip compressed
+        const body_slice = if (body_data.len >= 2 and body_data[0] == 0x1f and body_data[1] == 0x8b) blk: {
+            // It's gzipped, decompress it
+            var input_reader = std.Io.Reader.fixed(body_data);
+
+            // Create buffer for decompressed data
+            const decompressed_buffer = try self.allocator.alloc(u8, std.compress.flate.max_window_len);
+            defer self.allocator.free(decompressed_buffer);
+
+            // Initialize decompressor with gzip container
+            var decompress = std.compress.flate.Decompress.init(&input_reader, .gzip, decompressed_buffer);
+
+            // Read all decompressed data
+            var result = std.ArrayList(u8).empty;
+            defer result.deinit(self.allocator);
+
+            var temp_buffer: [4096]u8 = undefined;
+            while (true) {
+                const n = try decompress.reader.readSliceShort(&temp_buffer);
+                if (n == 0) break;
+                try result.appendSlice(self.allocator, temp_buffer[0..n]);
             }
-        }
-        
-        // Extract rate limit information
-        const rate_limit_info = errors.extractRateLimitInfo(headers_copy);
+
+            break :blk try self.allocator.dupe(u8, result.items);
+        } else
+            // Not compressed, use as-is
+            try self.allocator.dupe(u8, body_data);
+
+        // For now, we'll skip header processing due to API changes
+        const headers_copy = try self.allocator.alloc(http.Header, 0);
 
         return Response{
             .status = response.head.status,
             .body = body_slice,
             .headers = headers_copy,
             .allocator = self.allocator,
-            .request_id = request_id,
-            .rate_limit_info = rate_limit_info,
+            .request_id = null,
+            .rate_limit_info = null,
         };
     }
 
@@ -371,24 +317,24 @@ pub const AlpacaClient = struct {
         end: ?[]const u8,
         limit: ?u32,
     ) !Response {
-        var query = std.ArrayList(u8).init(self.allocator);
-        defer query.deinit();
+        var query = std.ArrayList(u8).empty;
+        defer query.deinit(self.allocator);
         
-        try query.appendSlice("/v2/stocks/");
-        try query.appendSlice(symbol);
-        try query.appendSlice("/bars?timeframe=");
-        try query.appendSlice(timeframe);
+        try query.appendSlice(self.allocator, "/v2/stocks/");
+        try query.appendSlice(self.allocator, symbol);
+        try query.appendSlice(self.allocator, "/bars?timeframe=");
+        try query.appendSlice(self.allocator, timeframe);
         
         if (start) |s| {
-            try query.appendSlice("&start=");
-            try query.appendSlice(s);
+            try query.appendSlice(self.allocator, "&start=");
+            try query.appendSlice(self.allocator, s);
         }
         if (end) |e| {
-            try query.appendSlice("&end=");
-            try query.appendSlice(e);
+            try query.appendSlice(self.allocator, "&end=");
+            try query.appendSlice(self.allocator, e);
         }
         if (limit) |l| {
-            try query.writer().print("&limit={d}", .{l});
+            try query.writer(self.allocator).print("&limit={d}", .{l});
         }
         
         return self.request(.GET, query.items, null, true);
@@ -400,21 +346,21 @@ pub const AlpacaClient = struct {
         period: ?[]const u8,
         timeframe: ?[]const u8,
     ) !Response {
-        var query = std.ArrayList(u8).init(self.allocator);
-        defer query.deinit();
+        var query = std.ArrayList(u8).empty;
+        defer query.deinit(self.allocator);
         
-        try query.appendSlice("/v2/account/portfolio/history");
+        try query.appendSlice(self.allocator, "/v2/account/portfolio/history");
         
         var first = true;
         if (period) |p| {
-            try query.appendSlice("?period=");
-            try query.appendSlice(p);
+            try query.appendSlice(self.allocator, "?period=");
+            try query.appendSlice(self.allocator, p);
             first = false;
         }
         if (timeframe) |t| {
-            try query.appendSlice(if (first) "?" else "&");
-            try query.appendSlice("timeframe=");
-            try query.appendSlice(t);
+            try query.appendSlice(self.allocator, if (first) "?" else "&");
+            try query.appendSlice(self.allocator, "timeframe=");
+            try query.appendSlice(self.allocator, t);
         }
         
         return self.request(.GET, query.items, null, false);
